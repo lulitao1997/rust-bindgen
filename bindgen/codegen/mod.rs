@@ -2179,6 +2179,13 @@ impl CodeGenerator for CompInfo {
         }
 
         if !is_opaque {
+            if !item.can_derive_copy(ctx) {
+                let prefix = ctx.trait_prefix();
+                fields.push( quote! { _marker: ::#prefix::marker::PhantomData<(*const (), ::#prefix::marker::PhantomPinned)>, } );
+            }
+        }
+
+        if !is_opaque {
             if item.has_vtable_ptr(ctx) {
                 let vtable = Vtable::new(item.id(), self);
                 vtable.codegen(ctx, result, item);
@@ -2407,6 +2414,7 @@ impl CodeGenerator for CompInfo {
         let mut needs_default_impl = false;
         let mut needs_debug_impl = false;
         let mut needs_partialeq_impl = false;
+        let mut needs_drop_impl = false;
         let needs_flexarray_impl = flex_array_generic.is_some();
         if let Some(comment) = item.comment(ctx) {
             attributes.push(attributes::doc(comment));
@@ -2734,6 +2742,7 @@ impl CodeGenerator for CompInfo {
 
             if ctx.options().codegen_config.destructors() {
                 if let Some((kind, destructor)) = self.destructor() {
+                    needs_drop_impl = true;
                     debug_assert!(kind.is_destructor());
                     Method::new(kind, destructor, false).codegen_method(
                         ctx,
@@ -2751,6 +2760,13 @@ impl CodeGenerator for CompInfo {
         let ty_for_impl = quote! {
             #canonical_ident #impl_generics_params
         };
+        if needs_drop_impl {
+            result.push(quote! {
+                impl #impl_generics_labels Drop for #ty_for_impl {
+                    unsafe fn drop(&mut self) { self.destruct(); }
+                }
+            });
+        }
 
         if needs_clone_impl {
             result.push(quote! {
@@ -3071,12 +3087,64 @@ impl Method {
         let function_name = ctx.rust_ident(function_name);
         let mut args = utils::fnsig_arguments(ctx, signature);
         let mut ret = utils::fnsig_return_ty(ctx, signature);
+        let mut self_pinned = false;
 
+        let ret_item = signature
+            .return_type()
+            .into_resolver()
+            .through_type_refs()
+            .through_type_aliases()
+            .resolve(ctx);
+
+        let type_is_copy = |item: &Item| -> bool {
+            match item.expect_type().canonical_type(ctx).kind() {
+                TypeKind::Void
+                    | TypeKind::NullPtr
+                    | TypeKind::Function(..)
+                    | TypeKind::Array(..)
+                    | TypeKind::Int(..)
+                    | TypeKind::Float(..) | TypeKind::Enum(..) => true,
+                TypeKind::Reference(r) | TypeKind::Pointer(r) => {
+                    !r.is_opaque(ctx, &())
+                },
+                TypeKind::Comp(..) => {
+                    item.can_derive_copy(ctx) && !item.annotations().disallow_copy() && !item.is_opaque(ctx, &())
+                },
+                TypeKind::Opaque => false,
+                _ => {
+                    dbg!(item);
+                    panic!();
+                }
+            }
+        };
+
+        let return_is_safe = type_is_copy(ret_item);
+
+        let prefix = ctx.trait_prefix();
         if !self.is_static() && !self.is_constructor() {
             args[0] = if self.is_const() {
                 quote! { &self }
             } else {
-                quote! { &mut self }
+                if self.kind() == MethodKind::Normal {
+                    let self_type = signature.argument_types()[0]
+                        .1
+                        .into_resolver()
+                        .through_type_refs()
+                        .through_type_aliases()
+                        .resolve(ctx).expect_type().kind();
+
+                    if let TypeKind::Pointer(self_type) = self_type {
+                        self_pinned = !self_type.can_derive_copy(ctx)
+                    } else {
+                        unreachable!()
+                    }
+                }
+
+                if self_pinned {
+                    quote! { self: &mut ::#prefix::pin::Pin<Box<Self>> }
+                } else {
+                    quote! { &mut self }
+                }
             };
         }
 
@@ -3087,7 +3155,7 @@ impl Method {
         // return-type = void.
         if self.is_constructor() {
             args.remove(0);
-            ret = quote! { -> Self };
+            ret = quote! { -> ::#prefix::pin::Pin<Box<Self>> };
         }
 
         let mut exprs =
@@ -3098,31 +3166,29 @@ impl Method {
         // If it's a constructor, we need to insert an extra parameter with a
         // variable called `__bindgen_tmp` we're going to create.
         if self.is_constructor() {
-            let prefix = ctx.trait_prefix();
-            let tmp_variable_decl = if ctx
-                .options()
-                .rust_features()
-                .maybe_uninit
-            {
-                exprs[0] = quote! {
-                    __bindgen_tmp.as_mut_ptr()
+            let tmp_variable_decl =
+                if ctx.options().rust_features().maybe_uninit {
+                    exprs[0] = quote! {
+                        __bindgen_tmp.as_mut_ptr()
+                    };
+                    quote! {
+                        let mut __bindgen_tmp = Box::new_uninit()
+                    }
+                } else {
+                    exprs[0] = quote! {
+                        &mut __bindgen_tmp
+                    };
+                    quote! {
+                        let mut __bindgen_tmp = ::#prefix::mem::uninitialized()
+                    }
                 };
-                quote! {
-                    let mut __bindgen_tmp = ::#prefix::mem::MaybeUninit::uninit()
-                }
-            } else {
-                exprs[0] = quote! {
-                    &mut __bindgen_tmp
-                };
-                quote! {
-                    let mut __bindgen_tmp = ::#prefix::mem::uninitialized()
-                }
-            };
             stmts.push(tmp_variable_decl);
         } else if !self.is_static() {
             assert!(!exprs.is_empty());
-            exprs[0] = quote! {
-                self
+            exprs[0] = if self_pinned {
+                quote! { self.as_mut().get_unchecked_mut() as *mut _ }
+            } else {
+                quote! { self }
             };
         };
 
@@ -3135,7 +3201,7 @@ impl Method {
         if self.is_constructor() {
             stmts.push(if ctx.options().rust_features().maybe_uninit {
                 quote! {
-                    __bindgen_tmp.assume_init()
+                    ::#prefix::pin::Pin::new(__bindgen_tmp.assume_init())
                 }
             } else {
                 quote! {
@@ -3153,9 +3219,14 @@ impl Method {
         }
 
         let name = ctx.rust_ident(&name);
+        let maybe_unsafe = if return_is_safe {
+            quote! {}
+        } else {
+            quote! { unsafe }
+        };
         methods.push(quote! {
             #(#attrs)*
-            pub unsafe fn #name ( #( #args ),* ) #ret {
+            pub #maybe_unsafe fn #name ( #( #args ),* ) #ret {
                 #block
             }
         });
@@ -5602,7 +5673,7 @@ pub(crate) mod utils {
         let ty = quote! {
             /// If Bindgen could only determine the size and alignment of a
             /// type, it is represented like this.
-            #[derive(PartialEq, Copy, Clone, Debug, Hash)]
+            #[derive(PartialEq, Debug, Hash)]
             #[repr(C)]
             pub struct __BindgenOpaqueArray<T: Copy, const N: usize>(pub [T; N]);
             impl<T: Copy + Default, const N: usize> Default for __BindgenOpaqueArray<T, N> {
