@@ -59,6 +59,7 @@ use proc_macro2::{Ident, Span};
 use quote::{ToTokens, TokenStreamExt};
 
 use crate::{Entry, HashMap, HashSet};
+use std::any::Any;
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -2178,6 +2179,13 @@ impl CodeGenerator for CompInfo {
             });
         }
 
+        // if !is_opaque {
+        //     if !item.can_derive_copy(ctx) {
+        //         let prefix = ctx.trait_prefix();
+        //         fields.push( quote! { _marker: ::#prefix::marker::PhantomData<(*const (), ::#prefix::marker::PhantomPinned)>, } );
+        //     }
+        // }
+
         if !is_opaque {
             if item.has_vtable_ptr(ctx) {
                 let vtable = Vtable::new(item.id(), self);
@@ -2407,6 +2415,7 @@ impl CodeGenerator for CompInfo {
         let mut needs_default_impl = false;
         let mut needs_debug_impl = false;
         let mut needs_partialeq_impl = false;
+        let mut needs_drop_impl = false;
         let needs_flexarray_impl = flex_array_generic.is_some();
         if let Some(comment) = item.comment(ctx) {
             attributes.push(attributes::doc(comment));
@@ -2734,6 +2743,7 @@ impl CodeGenerator for CompInfo {
 
             if ctx.options().codegen_config.destructors() {
                 if let Some((kind, destructor)) = self.destructor() {
+                    // needs_drop_impl = true;
                     debug_assert!(kind.is_destructor());
                     Method::new(kind, destructor, false).codegen_method(
                         ctx,
@@ -2751,6 +2761,13 @@ impl CodeGenerator for CompInfo {
         let ty_for_impl = quote! {
             #canonical_ident #impl_generics_params
         };
+        if needs_drop_impl {
+            result.push(quote! {
+                impl #impl_generics_labels Drop for #ty_for_impl {
+                    fn drop(&mut self) { unsafe { self.destruct(); } }
+                }
+            });
+        }
 
         if needs_clone_impl {
             result.push(quote! {
@@ -3072,6 +3089,46 @@ impl Method {
         let mut args = utils::fnsig_arguments(ctx, signature);
         let mut ret = utils::fnsig_return_ty(ctx, signature);
 
+        let ret_item = if self.is_constructor() {
+            signature.argument_types()[0].1
+        } else {
+            signature.return_type()
+        }.into_resolver().through_type_refs().through_type_aliases().resolve(ctx);
+
+        let ret_type = ret_item.expect_type();
+
+        let mut return_is_ptr = false;
+        let return_is_safe = match ret_type.canonical_type(ctx).kind() {
+            TypeKind::Void |
+            TypeKind::NullPtr |
+            TypeKind::Function(..) |
+            TypeKind::Array(..) |
+            TypeKind::Int(..) |
+            TypeKind::Float(..) |
+            TypeKind::Enum(..) => true,
+            TypeKind::Reference(r) => !r.is_opaque(ctx, &()),
+            TypeKind::Pointer(r) => {
+                if self.is_constructor() {
+                    r.can_derive_copy(ctx)
+                } else {
+                    return_is_ptr = true;
+                    let ty = r.into_resolver().resolve(ctx).to_rust_ty_or_opaque(ctx, &());
+                    ret = if self.is_const() { quote! { -> Option<& #ty> } } else {  quote! { -> Option<&mut #ty> } };
+                    !r.is_opaque(ctx, &())
+                }
+            }
+            TypeKind::Comp(..) => {
+                ret_item.can_derive_copy(ctx) &&
+                    !ret_item.annotations().disallow_copy() &&
+                    !ret_item.is_opaque(ctx, &())
+            }
+            TypeKind::Opaque => false,
+            _ => {
+                panic!("{:?}", ret_item);
+            }
+        };
+
+        let prefix = ctx.trait_prefix();
         if !self.is_static() && !self.is_constructor() {
             args[0] = if self.is_const() {
                 quote! { &self }
@@ -3087,7 +3144,11 @@ impl Method {
         // return-type = void.
         if self.is_constructor() {
             args.remove(0);
-            ret = quote! { -> Self };
+            ret = if return_is_safe {
+                quote! { -> Self }
+            } else {
+                quote! { -> ::#prefix::pin::Pin<Box<Self>> }
+            };
         }
 
         let mut exprs =
@@ -3107,8 +3168,14 @@ impl Method {
                 exprs[0] = quote! {
                     __bindgen_tmp.as_mut_ptr()
                 };
-                quote! {
-                    let mut __bindgen_tmp = ::#prefix::mem::MaybeUninit::uninit()
+                if return_is_safe {
+                    quote! {
+                        let mut __bindgen_tmp = ::#prefix::mem::MaybeUninit::uninit()
+                    }
+                } else {
+                    quote! {
+                        let mut __bindgen_tmp = Box::new_uninit()
+                    }
                 }
             } else {
                 exprs[0] = quote! {
@@ -3126,16 +3193,29 @@ impl Method {
             };
         };
 
-        let call = quote! {
+        let mut call = quote! {
             #function_name (#( #exprs ),* )
         };
+        if return_is_ptr {
+            call = if self.is_const() {
+                quote! { #call.as_ref() }
+            } else {
+                quote! { #call.as_mut() }
+            };
+        }
 
         stmts.push(call);
 
         if self.is_constructor() {
             stmts.push(if ctx.options().rust_features().maybe_uninit {
-                quote! {
-                    __bindgen_tmp.assume_init()
+                if return_is_safe {
+                    quote! {
+                        __bindgen_tmp.assume_init()
+                    }
+                } else {
+                    quote! {
+                        ::#prefix::pin::Pin::new(__bindgen_tmp.assume_init())
+                    }
                 }
             } else {
                 quote! {
@@ -3153,9 +3233,14 @@ impl Method {
         }
 
         let name = ctx.rust_ident(&name);
+        let maybe_unsafe = if self.is_constructor() || return_is_safe {
+            quote! {}
+        } else {
+            quote! { unsafe }
+        };
         methods.push(quote! {
             #(#attrs)*
-            pub unsafe fn #name ( #( #args ),* ) #ret {
+            pub #maybe_unsafe fn #name ( #( #args ),* ) #ret {
                 #block
             }
         });
