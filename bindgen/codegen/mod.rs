@@ -59,7 +59,6 @@ use proc_macro2::{Ident, Span};
 use quote::{ToTokens, TokenStreamExt};
 
 use crate::{Entry, HashMap, HashSet};
-use std::any::Any;
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -2743,9 +2742,9 @@ impl CodeGenerator for CompInfo {
 
             if ctx.options().codegen_config.destructors() {
                 if let Some((kind, destructor)) = self.destructor() {
-                    // needs_drop_impl = true;
+                    // don't generate for virtual destructor
                     debug_assert!(kind.is_destructor());
-                    Method::new(kind, destructor, false).codegen_method(
+                    needs_drop_impl = Method::new(kind, destructor, false).codegen_method(
                         ctx,
                         &mut methods,
                         &mut method_names,
@@ -2762,9 +2761,14 @@ impl CodeGenerator for CompInfo {
             #canonical_ident #impl_generics_params
         };
         if needs_drop_impl {
+            let drop_fn_ident = format_ident!(
+                "{}_{}_destructor",
+                canonical_ident,
+                canonical_ident
+            );
             result.push(quote! {
                 impl #impl_generics_labels Drop for #ty_for_impl {
-                    fn drop(&mut self) { unsafe { self.destruct(); } }
+                    fn drop(&mut self) { unsafe { #drop_fn_ident(self) } }
                 }
             });
         }
@@ -3015,7 +3019,7 @@ impl Method {
         method_names: &mut HashSet<String>,
         result: &mut CodegenResult<'_>,
         _parent: &CompInfo,
-    ) {
+    ) -> bool {
         assert!({
             let cc = &ctx.options().codegen_config;
             match self.kind() {
@@ -3030,17 +3034,17 @@ impl Method {
 
         // TODO(emilio): We could generate final stuff at least.
         if self.is_virtual() {
-            return; // FIXME
+            return false; // FIXME
         }
 
         // First of all, output the actual function.
         let function_item = ctx.resolve_item(self.signature());
         if !function_item.process_before_codegen(ctx, result) {
-            return;
+            return false;
         }
         let function = function_item.expect_function();
         let times_seen = function.codegen(ctx, result, function_item);
-        let Some(times_seen) = times_seen else { return };
+        let Some(times_seen) = times_seen else { return false };
         let signature_item = ctx.resolve_item(function.signature());
         let mut name = match self.kind() {
             MethodKind::Constructor => "new".into(),
@@ -3056,13 +3060,13 @@ impl Method {
 
         let supported_abi = signature.abi(ctx, Some(&*name)).is_ok();
         if !supported_abi {
-            return;
+            return false;
         }
 
         // Do not generate variadic methods, since rust does not allow
         // implementing them, and we don't do a good job at it anyway.
         if signature.is_variadic() {
-            return;
+            return false;
         }
 
         if method_names.contains(&name) {
@@ -3232,18 +3236,34 @@ impl Method {
             attrs.push(attributes::must_use());
         }
 
-        let name = ctx.rust_ident(&name);
-        let maybe_unsafe = if self.is_constructor() || return_is_safe {
-            quote! {}
-        } else {
-            quote! { unsafe }
-        };
-        methods.push(quote! {
-            #(#attrs)*
-            pub #maybe_unsafe fn #name ( #( #args ),* ) #ret {
-                #block
+        fn pascal_to_snake(input: &str) -> String {
+            let mut snake_case = String::new();
+
+            for (i, ch) in input.chars().enumerate() {
+                if ch.is_uppercase() {
+                    if i > 0 {
+                        snake_case.push('_');
+                    }
+                    snake_case.push(ch.to_ascii_lowercase());
+                } else {
+                    snake_case.push(ch);
+                }
             }
-        });
+
+            snake_case
+        }
+
+        let name = ctx.rust_ident(&pascal_to_snake(&name));
+        if self.is_constructor() || return_is_safe {
+            methods.push(quote! {
+                #(#attrs)*
+                pub fn #name ( #( #args ),* ) #ret {
+                    #block
+                }
+            });
+            return true;
+        }
+        return false;
     }
 }
 
