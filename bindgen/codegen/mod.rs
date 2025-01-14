@@ -3102,6 +3102,7 @@ impl Method {
         let ret_type = ret_item.expect_type();
 
         let mut return_is_ptr = false;
+        let mut return_is_ref = false;
         let return_is_safe = match ret_type.canonical_type(ctx).kind() {
             TypeKind::Void |
             TypeKind::NullPtr |
@@ -3110,21 +3111,29 @@ impl Method {
             TypeKind::Int(..) |
             TypeKind::Float(..) |
             TypeKind::Enum(..) => true,
-            TypeKind::Reference(r) => !r.is_opaque(ctx, &()),
-            TypeKind::Pointer(r) => {
+            TypeKind::Reference(r) | TypeKind::Pointer(r) => {
                 if self.is_constructor() {
                     r.can_derive_copy(ctx)
                 } else {
-                    return_is_ptr = true;
+                    return_is_ptr = matches!(ret_type.canonical_type(ctx).kind(), TypeKind::Pointer(..));
+                    return_is_ref = !return_is_ptr;
                     let ty = r.into_resolver().resolve(ctx).to_rust_ty_or_opaque(ctx, &());
-                    ret = if self.is_const() { quote! { -> Option<& #ty> } } else {  quote! { -> Option<&mut #ty> } };
+                    ret = if self.is_const() { quote! { & #ty } } else { quote! { &mut #ty } } ;
+                    if return_is_ptr {
+                        ret = quote! { Option<#ret> };
+                    }
+                    ret = quote! { -> #ret };
                     !r.is_opaque(ctx, &())
                 }
             }
             TypeKind::Comp(..) => {
-                ret_item.can_derive_copy(ctx) &&
-                    !ret_item.annotations().disallow_copy() &&
-                    !ret_item.is_opaque(ctx, &())
+                if ret.to_string().contains("string_view") {
+                    true
+                } else {
+                    ret_item.can_derive_copy(ctx) &&
+                        !ret_item.annotations().disallow_copy() &&
+                        !ret_item.is_opaque(ctx, &())
+                }
             }
             TypeKind::Opaque => false,
             _ => {
@@ -3206,6 +3215,14 @@ impl Method {
             } else {
                 quote! { #call.as_mut() }
             };
+        }
+
+        if return_is_ref {
+            call = if self.is_const() {
+                quote! { &*#call }
+            } else {
+                quote! { &mut *#call }
+            }
         }
 
         stmts.push(call);
@@ -5786,6 +5803,7 @@ pub(crate) mod utils {
         match canonical_type_kind {
             TypeKind::Void => syn::parse_quote! { () },
             _ => sig.return_type().to_rust_ty_or_opaque(ctx, &()),
+
         }
     }
 
