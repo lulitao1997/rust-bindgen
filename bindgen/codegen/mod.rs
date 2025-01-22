@@ -3099,11 +3099,12 @@ impl Method {
             signature.return_type()
         }.into_resolver().through_type_refs().through_type_aliases().resolve(ctx);
 
-        let ret_type = ret_item.expect_type();
+        let ret_type = ret_item.expect_type().canonical_type(ctx);
 
         let mut return_is_ptr = false;
         let mut return_is_ref = false;
-        let return_is_safe = match ret_type.canonical_type(ctx).kind() {
+        let mut return_ptr_is_const = false;
+        let return_is_safe = match ret_type.kind() {
             TypeKind::Void |
             TypeKind::NullPtr |
             TypeKind::Function(..) |
@@ -3111,19 +3112,21 @@ impl Method {
             TypeKind::Int(..) |
             TypeKind::Float(..) |
             TypeKind::Enum(..) => true,
-            TypeKind::Reference(r) | TypeKind::Pointer(r) => {
+            TypeKind::Reference(inner) | TypeKind::Pointer(inner) => {
                 if self.is_constructor() {
-                    r.can_derive_copy(ctx)
+                    inner.can_derive_copy(ctx)
                 } else {
-                    return_is_ptr = matches!(ret_type.canonical_type(ctx).kind(), TypeKind::Pointer(..));
+                    return_is_ptr = matches!(ret_type.kind(), TypeKind::Pointer(..));
                     return_is_ref = !return_is_ptr;
-                    let ty = r.into_resolver().resolve(ctx).to_rust_ty_or_opaque(ctx, &());
-                    ret = if self.is_const() { quote! { & #ty } } else { quote! { &mut #ty } } ;
+                    return_ptr_is_const = ctx.resolve_type(*inner).is_const();
+
+                    let ty = inner.into_resolver().resolve(ctx).to_rust_ty_or_opaque(ctx, &());
+                    ret = if return_ptr_is_const { quote! { & #ty } } else { quote! { &mut #ty } } ;
                     if return_is_ptr {
                         ret = quote! { Option<#ret> };
                     }
                     ret = quote! { -> #ret };
-                    !r.is_opaque(ctx, &())
+                    !inner.is_opaque(ctx, &())
                 }
             }
             TypeKind::Comp(..) => {
@@ -3210,7 +3213,7 @@ impl Method {
             #function_name (#( #exprs ),* )
         };
         if return_is_ptr {
-            call = if self.is_const() {
+            call = if return_ptr_is_const {
                 quote! { #call.as_ref() }
             } else {
                 quote! { #call.as_mut() }
@@ -3218,7 +3221,7 @@ impl Method {
         }
 
         if return_is_ref {
-            call = if self.is_const() {
+            call = if return_ptr_is_const {
                 quote! { &*#call }
             } else {
                 quote! { &mut *#call }
